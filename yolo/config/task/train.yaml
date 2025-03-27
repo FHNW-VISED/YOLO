@@ -52,3 +52,9 @@ scheduler:
 ema:
   enable: true
   decay: 0.995
+
+# NOTE TO SELF: apparently NMS was not present during training to train with all the anchor boxes
+# nms:
+#   min_confidence: 0.5
+#   min_iou: 0.5
+#   max_bbox: 300

@@ -17,7 +17,9 @@ class BCELoss(nn.Module):
         # TODO: origin v9 assing pos_weight == 1?
         self.bce = BCEWithLogitsLoss(reduction="none")
 
-    def forward(self, predicts_cls: Tensor, targets_cls: Tensor, cls_norm: Tensor) -> Any:
+    def forward(
+        self, predicts_cls: Tensor, targets_cls: Tensor, cls_norm: Tensor
+    ) -> Any:
         return self.bce(predicts_cls, targets_cls).sum() / cls_norm
 
 
@@ -26,7 +28,12 @@ class BoxLoss(nn.Module):
         super().__init__()
 
     def forward(
-        self, predicts_bbox: Tensor, targets_bbox: Tensor, valid_masks: Tensor, box_norm: Tensor, cls_norm: Tensor
+        self,
+        predicts_bbox: Tensor,
+        targets_bbox: Tensor,
+        valid_masks: Tensor,
+        box_norm: Tensor,
+        cls_norm: Tensor,
     ) -> Any:
         valid_bbox = valid_masks[..., None].expand(-1, -1, 4)
         picked_predict = predicts_bbox[valid_bbox].view(-1, 4)
@@ -45,21 +52,33 @@ class DFLoss(nn.Module):
         self.reg_max = reg_max
 
     def forward(
-        self, predicts_anc: Tensor, targets_bbox: Tensor, valid_masks: Tensor, box_norm: Tensor, cls_norm: Tensor
+        self,
+        predicts_anc: Tensor,
+        targets_bbox: Tensor,
+        valid_masks: Tensor,
+        box_norm: Tensor,
+        cls_norm: Tensor,
     ) -> Any:
         valid_bbox = valid_masks[..., None].expand(-1, -1, 4)
         bbox_lt, bbox_rb = targets_bbox.chunk(2, -1)
-        targets_dist = torch.cat(((self.anchors_norm - bbox_lt), (bbox_rb - self.anchors_norm)), -1).clamp(
-            0, self.reg_max - 1.01
-        )
+        targets_dist = torch.cat(
+            ((self.anchors_norm - bbox_lt), (bbox_rb - self.anchors_norm)), -1
+        ).clamp(0, self.reg_max - 1.01)
         picked_targets = targets_dist[valid_bbox].view(-1)
         picked_predict = predicts_anc[valid_bbox].view(-1, self.reg_max)
 
         label_left, label_right = picked_targets.floor(), picked_targets.floor() + 1
-        weight_left, weight_right = label_right - picked_targets, picked_targets - label_left
+        weight_left, weight_right = (
+            label_right - picked_targets,
+            picked_targets - label_left,
+        )
 
-        loss_left = F.cross_entropy(picked_predict, label_left.to(torch.long), reduction="none")
-        loss_right = F.cross_entropy(picked_predict, label_right.to(torch.long), reduction="none")
+        loss_left = F.cross_entropy(
+            picked_predict, label_left.to(torch.long), reduction="none"
+        )
+        loss_right = F.cross_entropy(
+            picked_predict, label_right.to(torch.long), reduction="none"
+        )
         loss_dfl = loss_left * weight_left + loss_right * weight_right
         loss_dfl = loss_dfl.view(-1, 4).mean(-1)
         loss_dfl = (loss_dfl * box_norm).sum() / cls_norm
@@ -67,7 +86,13 @@ class DFLoss(nn.Module):
 
 
 class YOLOLoss:
-    def __init__(self, loss_cfg: LossConfig, vec2box: Vec2Box, class_num: int = 80, reg_max: int = 16) -> None:
+    def __init__(
+        self,
+        loss_cfg: LossConfig,
+        vec2box: Vec2Box,
+        class_num: int = 80,
+        reg_max: int = 16,
+    ) -> None:
         self.class_num = class_num
         self.vec2box = vec2box
 
@@ -85,10 +110,14 @@ class YOLOLoss:
         anchors_box = anchors_box / self.vec2box.scaler[None, :, None]
         return anchors_cls, anchors_box
 
-    def __call__(self, predicts: List[Tensor], targets: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
+    def __call__(
+        self, predicts: List[Tensor], targets: Tensor
+    ) -> Tuple[Tensor, Tensor, Tensor]:
         predicts_cls, predicts_anc, predicts_box = predicts
         # For each predicted targets, assign a best suitable ground truth box.
-        align_targets, valid_masks = self.matcher(targets, (predicts_cls.detach(), predicts_box.detach()))
+        align_targets, valid_masks = self.matcher(
+            targets, (predicts_cls.detach(), predicts_box.detach())
+        )
 
         targets_cls, targets_bbox = self.separate_anchor(align_targets)
         predicts_box = predicts_box / self.vec2box.scaler[None, :, None]
@@ -109,7 +138,12 @@ class YOLOLoss:
 class DualLoss:
     def __init__(self, cfg: Config, vec2box) -> None:
         loss_cfg = cfg.task.loss
-        self.loss = YOLOLoss(loss_cfg, vec2box, class_num=cfg.dataset.class_num, reg_max=cfg.model.anchor.reg_max)
+        self.loss = YOLOLoss(
+            loss_cfg,
+            vec2box,
+            class_num=cfg.dataset.class_num,
+            reg_max=cfg.model.anchor.reg_max,
+        )
 
         self.aux_rate = loss_cfg.aux
 
@@ -130,7 +164,8 @@ class DualLoss:
             self.cls_rate * (aux_cls * self.aux_rate + main_cls),
         ]
         loss_dict = {
-            f"Loss/{name}Loss": value.detach().item() for name, value in zip(["Box", "DFL", "BCE"], total_loss)
+            f"Loss/{name}Loss": value.detach().item()
+            for name, value in zip(["Box", "DFL", "BCE"], total_loss)
         }
         return sum(total_loss), loss_dict
 
