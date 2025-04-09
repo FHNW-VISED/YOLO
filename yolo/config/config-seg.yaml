@@ -1,0 +1,13 @@
+hydra:
+  run:
+    dir: runs
+
+name: v9-custom-seg-model
+
+defaults:
+  - _self_
+  - model: v9-c-seg
+  - task: train-seg
+  - general
+  - dataset: coco
+
