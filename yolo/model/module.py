@@ -160,7 +160,7 @@ class MultiheadSegmentation(nn.Module):
         self.heads.append(Conv(proto_channels, num_maskes, 1))
 
     def forward(self, x_list: List[torch.Tensor]) -> List[torch.Tensor]:
-        return [head(x) for x, head in zip(x_list, self.heads)]
+        return self.detect(x_list), [head(x) for x, head in zip(x_list, self.heads)]
 
 
 class Anchor2Vec(nn.Module):
