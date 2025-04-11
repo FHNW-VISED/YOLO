@@ -149,7 +149,7 @@ class YOLOLoss:
         loss_dfl = self.dfl(predicts_anc, targets_bbox, valid_masks, box_norm, cls_norm)
         ## -- SEG -- ##
         loss_seg = 0
-        if self.seg is not None:
+        if self.seg is not None and seg_logits_preds is not None:
             loss_seg = self.seg(
                 seg_logits_preds,
                 targets_logits_seg,
@@ -187,6 +187,26 @@ class MaskLoss(nn.Module):
         cls_norm,
         box_norm,
     ):
+        """
+        Computes the mask loss based on the predicted logits and ground truth masks.
+        
+        Args:
+            pred_logits (List[Tensor]): List of predicted logits for each prototype 
+                List of predicted masks + prototype, the shapes are (Batch size, n_prototype_masks, h, w) and they are normally in decreasing dimension except the last one that is the prototype and is normally bigger.
+                Eg: [Tensor(3, 32, 64, 64), Tensor(3, 32, 32, 32), Tensor(3, 32, 16, 16), Tensor(3, 32, 128, 128)]
+            targets (Tensor): Ground truth masks of shape (Batch size, max_preds_in_batch, h, w).
+                Eg.: Tensor(3, 10, 512, 512)
+            valid_masks (bool Tensor): Boolean tensor indicating valid masks of shape (Batch size, all_predicted_anchors).
+                Eg.: Tensor(3, 5376)
+            anchor_to_gt_idxs (Tensor): Tensor mapping anchors to ground truth indices of shape (Batch size, all_predicted_anchors, 1).
+                Eg.: Tensor(3, 5376, 1)
+            gt_boxes (Tensor): Ground truth boxes of shape (Batch size, max_preds_in_batch, 5).
+                Eg.: Tensor(3, 10, 5)
+            cls_norm (Tensor): Normalization factor for the classification loss.
+                Eg.: Tensor(1.0)
+            box_norm (Tensor): Normalization factor for the box loss. The shape is (Number of valid masks).
+                Eg.: Tensor(valid_masks.sum())
+        """
         # Determine prototype dimensions from the last predicted tensor.
         proto_h, proto_w = pred_logits[-1].shape[-2:]
 
@@ -272,7 +292,7 @@ class DualLoss:
         self.iou_rate = loss_cfg.objective["BoxLoss"]
         self.dfl_rate = loss_cfg.objective["DFLoss"]
         self.cls_rate = loss_cfg.objective["BCELoss"]
-        self.seg_rate = loss_cfg.objective.get("LincombMaskLoss", 0)
+        self.seg_rate = loss_cfg.objective.get("LincombMaskLoss", None)
 
         self.loss = YOLOLoss(
             loss_cfg,
@@ -292,7 +312,7 @@ class DualLoss:
         aux_seg_logits: Optional[List[Tensor]] = None,
         main_seg_logits: Optional[List[Tensor]] = None,
     ) -> Tuple[Tensor, Dict[str, float]]:
-        if self.seg_rate > 0:
+        if self.seg_rate is not None:
             assert (
                 target_seg is not None
                 and aux_seg_logits is not None
@@ -306,6 +326,8 @@ class DualLoss:
         main_iou, main_dfl, main_cls, main_seg = self.loss(
             main_predicts, targets, main_seg_logits, target_seg
         )
+        
+        self.seg_rate = self.seg_rate or torch.tensor(0.0)
 
         total_loss = [
             self.iou_rate * (aux_iou * self.aux_rate + main_iou),
@@ -325,4 +347,3 @@ def create_loss_function(cfg: Config, vec2box) -> DualLoss:
     loss_function = DualLoss(cfg, vec2box)
     logger.info(":white_check_mark: Success load loss function")
     return loss_function
-
