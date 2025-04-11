@@ -1,6 +1,7 @@
 import math
 from typing import Dict, List, Optional, Tuple, Union
 
+import cv2
 import torch
 from einops import rearrange
 from torch import Tensor, tensor
@@ -435,6 +436,7 @@ class Vec2Box:
         pred_LTRB = preds_box * self.scaler.view(1, -1, 1)
         lt, rb = pred_LTRB.chunk(2, dim=-1)
         preds_box = torch.cat([self.anchor_grid - lt, self.anchor_grid + rb], dim=-1)
+
         return preds_cls, preds_anc, preds_box
 
 
@@ -529,31 +531,84 @@ def bbox_nms(
     bbox: Tensor,
     nms_cfg: NMSConfig,
     confidence: Optional[Tensor] = None,
+    seg_mask: Optional[Tensor] = None,
+    image_size: Optional[Tuple[int, int]] = None,
 ):
-    cls_dist = cls_dist.sigmoid() * (1 if confidence is None else confidence)
+    # Compute final classification scores: apply sigmoid and optionally weight by confidence.
+    final_scores = cls_dist.sigmoid() * (1 if confidence is None else confidence)
 
-    batch_idx, valid_grid, valid_cls = torch.where(cls_dist > nms_cfg.min_confidence)
-    valid_con = cls_dist[batch_idx, valid_grid, valid_cls]
-    valid_box = bbox[batch_idx, valid_grid]
-
-    nms_idx = batched_nms(
-        valid_box, valid_con, batch_idx + valid_cls * bbox.size(0), nms_cfg.min_iou
+    # Identify valid detections based on the minimum confidence threshold.
+    batch_indices, grid_indices, class_indices = torch.where(
+        final_scores > nms_cfg.min_confidence
     )
+    valid_scores = final_scores[batch_indices, grid_indices, class_indices]
+    valid_boxes = bbox[batch_indices, grid_indices]
+    valid_seg_masks = (
+        None if seg_mask is None else seg_mask[batch_indices, grid_indices]
+    )
+
+    # Group boxes by a unique identifier combining batch and class information,
+    # then apply batched non-maximum suppression.
+    group_ids = batch_indices + class_indices * bbox.size(0)
+    keep_indices = batched_nms(valid_boxes, valid_scores, group_ids, nms_cfg.min_iou)
+
+    # Prepare lists to collect the final predictions and segmentation masks.
     predicts_nms = []
-    for idx in range(cls_dist.size(0)):
-        instance_idx = nms_idx[idx == batch_idx[nms_idx]]
+    predicts_nms_seg = []
 
-        predict_nms = torch.cat(
-            [
-                valid_cls[instance_idx][:, None],
-                valid_box[instance_idx],
-                valid_con[instance_idx][:, None],
-            ],
-            dim=-1,
-        )
+    # Process each batch (image) separately.
+    for batch in range(cls_dist.size(0)):
+        # Select indices corresponding to the current batch.
+        batch_mask = batch_indices[keep_indices] == batch
+        selected_indices = keep_indices[batch_mask]
 
-        predicts_nms.append(predict_nms[: nms_cfg.max_bbox])
-    return predicts_nms
+        # Construct the prediction tensor by concatenating class, bbox coordinates, and score.
+        if selected_indices.numel() > 0:
+            prediction = torch.cat(
+                [
+                    class_indices[selected_indices].unsqueeze(-1),
+                    valid_boxes[selected_indices],
+                    valid_scores[selected_indices].unsqueeze(-1),
+                ],
+                dim=-1,
+            )
+            # Limit the number of predictions to the configured maximum.
+            predicts_nms.append(prediction[: nms_cfg.max_bbox])
+        else:
+            # Append an empty tensor if there are no predictions for this batch.
+            predicts_nms.append(
+                torch.empty((0, valid_boxes.size(-1) + 2), device=bbox.device)
+            )
+
+        # Process segmentation masks if they were provided.
+        if seg_mask is not None and valid_seg_masks is not None:
+            if selected_indices.numel() > 0:
+                seg_nms = valid_seg_masks[selected_indices]
+
+                # Resize segmentation masks to the original image size if specified.
+                if image_size is not None:
+                    seg_nms = rearrange(seg_nms, "N H W -> H W N")
+                    seg_nms_np = cv2.resize(
+                        seg_nms.cpu().numpy(),
+                        (image_size[1], image_size[0]),
+                        interpolation=cv2.INTER_NEAREST,
+                    )
+                    # Ensure the segmentation mask has the correct dimensions.
+                    if seg_nms_np.ndim == 2:
+                        seg_nms_np = seg_nms_np[None, :, :]
+                    else:
+                        seg_nms_np = rearrange(seg_nms_np, "H W N -> N H W")
+                    seg_nms = torch.from_numpy(seg_nms_np).to(seg_mask.device)
+
+                predicts_nms_seg.append(
+                    mask_tensor_with_boxes(seg_nms, valid_boxes[selected_indices])
+                )
+            else:
+                predicts_nms_seg.append(
+                    torch.empty((0, *seg_mask.shape[-2:]), device=seg_mask.device)
+                )
+
+    return predicts_nms, predicts_nms_seg
 
 
 def calculate_map(predictions, ground_truths) -> Dict[str, Tensor]:
@@ -571,7 +626,16 @@ def to_metrics_format(prediction: Tensor) -> Dict[str, Union[float, Tensor]]:
 
 
 def mask_tensor_with_boxes(tensor_to_mask, masking_boxes):
-    _, H, W = tensor_to_mask.shape
+    """
+    Mask a tensor with bounding boxes.
+
+    Args:
+        tensor_to_mask (Tensor): The tensor to be masked, shape (N, H, W).
+        masking_boxes (Tensor): The bounding boxes to mask with, shape (N, 4).
+    """
+    N, H, W = tensor_to_mask.shape
+    # Ensure masking_boxes is of shape (N, 4)
+    assert masking_boxes.shape == (N, 4), "masking_boxes must be of shape (N, 4)"
 
     # Create coordinate grid for the image indices.
     # ys: each row has the y-coordinate, xs: each column has the x-coordinate.

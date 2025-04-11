@@ -194,15 +194,36 @@ class PostProcess:
         predict,
         rev_tensor: Optional[Tensor] = None,
         image_size: Optional[List[int]] = None,
-    ) -> List[Tensor]:
+        seg_threshold: float = 0.5,
+    ) -> Union[Tensor, List[Tensor]]:
         if image_size is not None:
             self.converter.update(image_size)
-        prediction = self.converter(predict["Main"])
+
+        predict = predict["Main"]
+
+        seg_preds = None
+        if isinstance(predict, tuple):
+            predict, seg_logits = predict
+            seg_preds = get_mask_preds(seg_logits, sigmoid=True)
+            seg_preds = (seg_preds > seg_threshold).to(torch.int8)
+
+        prediction = self.converter(predict)
         pred_class, _, pred_bbox = prediction[:3]
         pred_conf = prediction[3] if len(prediction) == 4 else None
         if rev_tensor is not None:
             pred_bbox = (pred_bbox - rev_tensor[:, None, 1:]) / rev_tensor[:, 0:1, None]
-        pred_bbox = bbox_nms(pred_class, pred_bbox, self.nms, pred_conf)
+        pred_bbox, pred_mask = bbox_nms(
+            pred_class,
+            pred_bbox,
+            self.nms,
+            pred_conf,
+            seg_preds,
+            self.converter.image_size,
+        )
+
+        if pred_mask is not None:
+            return pred_bbox, pred_mask
+
         return pred_bbox
 
 
