@@ -388,15 +388,10 @@ class BoxMatcher:
         align_cls = align_cls * normalize_term * valid_mask[:, :, None]
         anchor_matched_targets = torch.cat([align_cls, align_bbox], dim=-1)
 
-        # get the aligned masks
-        aligned_masks = None
-        if target_masks is not None:
-            aligned_masks = torch.gather(
-                target_masks,
-                1,
-                unique_indices[..., None].repeat(1, 1, *target_masks.shape[2:]),
-            )
-        return anchor_matched_targets, valid_mask, aligned_masks
+        # to the aligned masks later
+        aligned_masks_unique_idxs = unique_indices[..., None]
+            
+        return anchor_matched_targets, valid_mask, aligned_masks_unique_idxs
 
 
 class Vec2Box:

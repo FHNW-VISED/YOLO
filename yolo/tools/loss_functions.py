@@ -131,7 +131,7 @@ class YOLOLoss:
     ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
         predicts_cls, predicts_anc, predicts_box = predicts
         # For each predicted targets, assign a best suitable ground truth box.
-        align_targets, valid_masks, align_targets_seg = self.matcher(
+        align_targets, valid_masks, aligned_masks_unique_idxs = self.matcher(
             targets, (predicts_cls.detach(), predicts_box.detach()), targets_seg
         )
 
@@ -152,7 +152,8 @@ class YOLOLoss:
         if self.seg is not None and seg_logits_preds is not None:
             loss_seg = self.seg(
                 seg_logits_preds,
-                align_targets_seg,
+                targets_seg,
+                aligned_masks_unique_idxs,
                 valid_masks,
                 align_targets.clone()[..., 2:],
                 cls_norm,
@@ -164,13 +165,13 @@ class YOLOLoss:
 
 class MaskLoss(nn.Module):
     """
-    Computes the mask loss by comparing predicted masks with the corresponding downsampled
-    ground truth masks. The process includes:
-      - Downsampling target masks to match the prototype shape.
-      - Adjusting ground truth boxes and reshaping them.
-      - Computing predicted masks (with sigmoid activation).
-      - Masking the predicted masks using the ground truth boxes.
-      - Computing a per-mask binary cross entropy loss and aggregating normalized losses.
+    Computes the mask loss by comparing predicted masks with the downsampled ground truth masks.
+    The steps include:
+      - Downsampling ground truth masks to prototype dimensions.
+      - Rescaling the ground truth boxes.
+      - Generating predicted masks with a sigmoid activation.
+      - Gathering the aligned mask regions and applying ground truth boxes.
+      - Computing a normalized binary cross entropy loss for each mask.
     """
 
     def __init__(self):
@@ -178,99 +179,101 @@ class MaskLoss(nn.Module):
 
     def forward(
         self,
-        seg_logits_preds,
-        align_targets_seg,
-        valid_masks,
-        aligned_gt_boxes,
-        cls_norm,
-        box_norm,
+        seg_logits_list,
+        gt_masks,
+        unique_mask_indices,
+        valid_mask_flags,
+        gt_boxes_aligned,
+        cls_normalizer,
+        box_normalizer,
     ):
         """
-        Computes the mask loss based on the predicted logits and ground truth masks.
+        Computes the mask loss.
 
         Args:
-            pred_logits (List[Tensor]): List of predicted logits for each prototype
-                List of predicted masks + prototype, the shapes are (Batch size, n_prototype_masks, h, w) and they are normally in decreasing dimension except the last one that is the prototype and is normally bigger.
-                Eg: [Tensor(3, 32, 64, 64), Tensor(3, 32, 32, 32), Tensor(3, 32, 16, 16), Tensor(3, 32, 128, 128)]
-            targets (Tensor): Ground truth masks of shape (Batch size, max_preds_in_batch, h, w).
-                Eg.: Tensor(3, 10, 512, 512)
-            valid_masks (bool Tensor): Boolean tensor indicating valid masks of shape (Batch size, all_predicted_anchors).
-                Eg.: Tensor(3, 5376)
-            anchor_to_gt_idxs (Tensor): Tensor mapping anchors to ground truth indices of shape (Batch size, all_predicted_anchors, 1).
-                Eg.: Tensor(3, 5376, 1)
-            gt_boxes (Tensor): Ground truth boxes of shape (Batch size, max_preds_in_batch, 5).
-                Eg.: Tensor(3, 10, 5)
-            cls_norm (Tensor): Normalization factor for the classification loss.
-                Eg.: Tensor(1.0)
-            box_norm (Tensor): Normalization factor for the box loss. The shape is (Number of valid masks).
-                Eg.: Tensor(valid_masks.sum())
-        """
-        # Determine prototype dimensions from the last predicted tensor.
-        proto_h, proto_w = seg_logits_preds[-1].shape[-2:]
+            seg_logits_list (List[Tensor]): List of predicted logits for each prototype.
+                Example shapes: [Tensor(3, 32, 64, 64), Tensor(3, 32, 32, 32), ...]
+            gt_masks (Tensor): Ground truth masks with shape (Batch, max_preds, H, W).
+                Example: Tensor(3, 10, 512, 512)
+            unique_mask_indices (List[Tensor]): Unique indices to gather aligned masks for each batch item.
+            valid_mask_flags (Tensor): Boolean tensor indicating valid masks; shape (Batch, total_anchors).
+            gt_boxes_aligned (Tensor): Ground truth boxes, shape (Batch, max_preds, 5).
+            cls_normalizer (Tensor): Normalizing factor for classification loss.
+            box_normalizer (Tensor): Normalizing factor for box loss, shaped as (Number of valid masks).
 
-        # Downsample target masks to match the prototype dimensions, then binarize.
-        downsampled_targets = (
+        Returns:
+            final_loss (Tensor): The aggregated normalized mask loss.
+        """
+        # Determine target prototype dimensions from the last predicted logits.
+        proto_h, proto_w = seg_logits_list[-1].shape[-2:]
+
+        # Downsample ground truth masks to match prototype shape and binarize.
+        downsampled_gt_masks = (
             F.interpolate(
-                align_targets_seg,
-                size=(proto_h, proto_w),
-                mode="bilinear",
-                align_corners=False,
+                gt_masks, size=(proto_h, proto_w), mode="bilinear", align_corners=False
             )
             .gt(0.5)
             .float()
         )
 
-        # Remove the first coordinate from gt_boxes and rescale to the downsampled target shape.
+        # Rescale ground truth boxes to match the downsampled mask dimensions.
         rescaled_gt_boxes = reshape_batched_bboxes(
-            aligned_gt_boxes, align_targets_seg.shape[-2:], downsampled_targets.shape[-2:]
+            gt_boxes_aligned, gt_masks.shape[-2:], downsampled_gt_masks.shape[-2:]
         )
 
-        # Obtain predicted masks (apply sigmoid activation).
-        seg_preds = get_mask_preds(seg_logits_preds, sigmoid=True)
+        # Generate predicted masks by applying sigmoid activation.
+        pred_masks = get_mask_preds(seg_logits_list, sigmoid=True)
 
-        # Initialize a tensor to accumulate losses for all valid predictions.
-        total_losses = torch.zeros(valid_masks.sum(), device=seg_logits_preds[0].device)
-        loss_index = 0
+        # Initialize a tensor to accumulate the normalized losses.
+        total_losses = torch.zeros(
+            valid_mask_flags.sum(), device=seg_logits_list[0].device
+        )
+        loss_count = 0
 
-        # Iterate over each sample in the batch.
-        for down_target, seg_pred, valid_mask, gt_box in zip(
-            downsampled_targets,
-            seg_preds,
-            valid_masks,
+        # Process each item in the batch.
+        for down_gt, pred_mask, valid_flags, boxes, indices in zip(
+            downsampled_gt_masks,
+            pred_masks,
+            valid_mask_flags,
             rescaled_gt_boxes,
+            unique_mask_indices,
         ):
-            num_matches = valid_mask.sum()
-            if num_matches == 0:
+            num_valid = valid_flags.sum()
+            if num_valid == 0:
                 continue
 
-            # Select predictions and corresponding ground truth indices based on the valid mask.
-            valid_pred = seg_pred[valid_mask]
-            matched_gt_boxes = gt_box[valid_mask]
-            matched_gt_masks = down_target[valid_mask]
-
-            # Mask the predicted masks using the ground truth boxes.
-            masked_preds = mask_tensor_with_boxes(valid_pred, matched_gt_boxes)
-
-            # Compute per-pixel binary cross entropy loss.
-            loss_per_pixel = F.binary_cross_entropy(
-                masked_preds, matched_gt_masks, reduction="none"
+            # Gather the aligned ground truth masks based on unique indices.
+            valid_indices = indices[valid_flags]
+            valid_gt_masks = torch.gather(
+                down_gt, 0, valid_indices.repeat(1, *down_gt.shape[1:])
             )
-            # Sum the loss for each mask.
-            loss_per_mask = loss_per_pixel.view(loss_per_pixel.shape[0], -1).sum(dim=-1)
 
-            # Compute the area of each ground truth mask.
-            area_per_mask = matched_gt_masks.view(matched_gt_masks.shape[0], -1).sum(
-                dim=-1
+            # Select only valid predictions and corresponding ground truth elements.
+            valid_pred_masks = pred_mask[valid_flags]
+            valid_boxes = boxes[valid_flags]
+
+            # Apply ground truth boxes to mask the predictions.
+            masked_pred = mask_tensor_with_boxes(valid_pred_masks, valid_boxes)
+
+            # Compute per-pixel binary cross entropy loss without reduction.
+            pixel_loss = F.binary_cross_entropy(
+                masked_pred, valid_gt_masks, reduction="none"
             )
+            # Sum loss per mask.
+            loss_per_mask = pixel_loss.view(pixel_loss.size(0), -1).sum(dim=-1)
+
+            # Compute the area (sum of pixels) of each ground truth mask.
+            area_per_mask = valid_gt_masks.view(valid_gt_masks.size(0), -1).sum(dim=-1)
+            # Normalize loss per mask by its area.
             norm_loss_per_mask = loss_per_mask / (area_per_mask.float() + 1e-6)
 
-            total_losses[loss_index : loss_index + num_matches] = norm_loss_per_mask
-            loss_index += num_matches
+            total_losses[loss_count : loss_count + num_valid] = norm_loss_per_mask
+            loss_count += num_valid
 
-        # Aggregate the loss across all valid predictions and apply normalizations:
-        # - box_norm and cls_norm (like the other losses)
-        # - valid_masks.sum(): since the mask loss was 3 orders of magnitude higher than the others, this makes them comparable
-        final_loss = (total_losses * box_norm).sum() / (cls_norm * valid_masks.sum())
+        # Aggregate the normalized loss with provided normalizers.
+        final_loss = (total_losses * box_normalizer).sum() / (
+            cls_normalizer * valid_mask_flags.sum()
+        )
         return final_loss
 
 
