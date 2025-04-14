@@ -2,6 +2,7 @@ import math
 from typing import Dict, List, Optional, Tuple, Union
 
 import cv2
+import torch.nn.functional as F
 import torch
 from einops import rearrange
 from torch import Tensor, tensor
@@ -607,18 +608,19 @@ def bbox_nms(
 
                 # Resize segmentation masks to the original image size if specified.
                 if image_size is not None:
-                    seg_nms = rearrange(seg_nms, "N H W -> H W N")
-                    seg_nms_np = cv2.resize(
-                        seg_nms.cpu().numpy(),
-                        (image_size[1], image_size[0]),
-                        interpolation=cv2.INTER_NEAREST,
-                    )
-                    # Ensure the segmentation mask has the correct dimensions.
-                    if seg_nms_np.ndim == 2:
-                        seg_nms_np = seg_nms_np[None, :, :]
-                    else:
-                        seg_nms_np = rearrange(seg_nms_np, "H W N -> N H W")
-                    seg_nms = torch.from_numpy(seg_nms_np).to(seg_mask.device)
+                    seg_nms = F.interpolate(
+                        seg_nms.unsqueeze(0).float(),  # add batch dimension
+                        size=image_size,
+                        mode="bicubic",
+                        antialias=True
+                    ) 
+                    
+                    # Threshold to rebinarize
+                    seg_nms = (seg_nms > 0.4).float()
+                    
+                    # Morphological smoothing
+                    kernel = torch.ones(3, 3, device=seg_nms.device)  # Small smoothing kernel
+                    seg_nms = F.max_pool2d(seg_nms, kernel_size=3, padding=1, stride=1)[0]
 
                 predicts_nms_seg.append(
                     mask_tensor_with_boxes(seg_nms, valid_boxes[selected_indices])

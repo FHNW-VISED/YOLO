@@ -204,8 +204,7 @@ class PostProcess:
         seg_preds = None
         if isinstance(predict, tuple):
             predict, seg_logits = predict
-            seg_preds = get_mask_preds(seg_logits, sigmoid=True)
-            seg_preds = (seg_preds > seg_threshold).to(torch.int8)
+            seg_preds = get_mask_preds(seg_logits, sigmoid=True).float()
 
         prediction = self.converter(predict)
         pred_class, _, pred_bbox = prediction[:3]
@@ -222,6 +221,7 @@ class PostProcess:
         )
 
         if pred_mask is not None:
+            pred_mask = [(x > seg_threshold).float() for x in pred_mask]
             return pred_bbox, pred_mask
 
         return pred_bbox
