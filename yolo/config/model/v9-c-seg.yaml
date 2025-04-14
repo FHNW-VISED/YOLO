@@ -82,7 +82,7 @@ model:
 
     - MultiheadSegmentation:
         source: [P3, P4, P5, -1]
-        args: {num_maskes: 32}
+        args: {num_maskes: 10}
         tags: Main
         output: True
 
@@ -146,6 +146,6 @@ model:
 
     - MultiheadSegmentation:
         source: [A3, A4, A5, -1]
-        args: {num_maskes: 32}
+        args: {num_maskes: 10}
         tags: AUX
         output: True

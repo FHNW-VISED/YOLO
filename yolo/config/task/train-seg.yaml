@@ -31,7 +31,7 @@ loss:
     BCELoss: 0.5
     BoxLoss: 7.5
     DFLoss: 1.5
-    LincombMaskLoss: 3
+    LincombMaskLoss: 10
 
   aux:
     0.25

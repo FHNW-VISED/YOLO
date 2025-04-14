@@ -127,12 +127,12 @@ class YOLOLoss:
         predicts: List[Tensor],
         targets: Tensor,
         seg_logits_preds: Optional[List[Tensor]] = None,
-        targets_logits_seg: Optional[Tensor] = None,
+        targets_seg: Optional[Tensor] = None,
     ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
         predicts_cls, predicts_anc, predicts_box = predicts
         # For each predicted targets, assign a best suitable ground truth box.
-        align_targets, valid_masks, anchor_to_gt_idxs = self.matcher(
-            targets, (predicts_cls.detach(), predicts_box.detach())
+        align_targets, valid_masks, align_targets_seg = self.matcher(
+            targets, (predicts_cls.detach(), predicts_box.detach()), targets_seg
         )
 
         targets_cls, targets_bbox = self.separate_anchor(align_targets)
@@ -152,10 +152,9 @@ class YOLOLoss:
         if self.seg is not None and seg_logits_preds is not None:
             loss_seg = self.seg(
                 seg_logits_preds,
-                targets_logits_seg,
+                align_targets_seg,
                 valid_masks,
-                anchor_to_gt_idxs,
-                targets,
+                align_targets.clone()[..., 2:],
                 cls_norm,
                 box_norm,
             )
@@ -179,19 +178,18 @@ class MaskLoss(nn.Module):
 
     def forward(
         self,
-        pred_logits,
-        targets,
+        seg_logits_preds,
+        align_targets_seg,
         valid_masks,
-        anchor_to_gt_idxs,
-        gt_boxes,
+        aligned_gt_boxes,
         cls_norm,
         box_norm,
     ):
         """
         Computes the mask loss based on the predicted logits and ground truth masks.
-        
+
         Args:
-            pred_logits (List[Tensor]): List of predicted logits for each prototype 
+            pred_logits (List[Tensor]): List of predicted logits for each prototype
                 List of predicted masks + prototype, the shapes are (Batch size, n_prototype_masks, h, w) and they are normally in decreasing dimension except the last one that is the prototype and is normally bigger.
                 Eg: [Tensor(3, 32, 64, 64), Tensor(3, 32, 32, 32), Tensor(3, 32, 16, 16), Tensor(3, 32, 128, 128)]
             targets (Tensor): Ground truth masks of shape (Batch size, max_preds_in_batch, h, w).
@@ -208,12 +206,12 @@ class MaskLoss(nn.Module):
                 Eg.: Tensor(valid_masks.sum())
         """
         # Determine prototype dimensions from the last predicted tensor.
-        proto_h, proto_w = pred_logits[-1].shape[-2:]
+        proto_h, proto_w = seg_logits_preds[-1].shape[-2:]
 
         # Downsample target masks to match the prototype dimensions, then binarize.
         downsampled_targets = (
             F.interpolate(
-                targets,
+                align_targets_seg,
                 size=(proto_h, proto_w),
                 mode="bilinear",
                 align_corners=False,
@@ -223,24 +221,22 @@ class MaskLoss(nn.Module):
         )
 
         # Remove the first coordinate from gt_boxes and rescale to the downsampled target shape.
-        gt_boxes = gt_boxes[..., 1:]
         rescaled_gt_boxes = reshape_batched_bboxes(
-            gt_boxes, targets.shape[-2:], downsampled_targets.shape[-2:]
+            aligned_gt_boxes, align_targets_seg.shape[-2:], downsampled_targets.shape[-2:]
         )
 
         # Obtain predicted masks (apply sigmoid activation).
-        preds = get_mask_preds(pred_logits, sigmoid=True)
+        seg_preds = get_mask_preds(seg_logits_preds, sigmoid=True)
 
         # Initialize a tensor to accumulate losses for all valid predictions.
-        total_losses = torch.zeros(valid_masks.sum(), device=pred_logits[0].device)
+        total_losses = torch.zeros(valid_masks.sum(), device=seg_logits_preds[0].device)
         loss_index = 0
 
         # Iterate over each sample in the batch.
-        for down_target, pred, valid_mask, anchor_to_gt, gt_box in zip(
+        for down_target, seg_pred, valid_mask, gt_box in zip(
             downsampled_targets,
-            preds,
+            seg_preds,
             valid_masks,
-            anchor_to_gt_idxs,
             rescaled_gt_boxes,
         ):
             num_matches = valid_mask.sum()
@@ -248,14 +244,9 @@ class MaskLoss(nn.Module):
                 continue
 
             # Select predictions and corresponding ground truth indices based on the valid mask.
-            valid_pred = pred[valid_mask]
-            valid_anchor_to_gt = anchor_to_gt[valid_mask]
-
-            # Retrieve the matched ground truth boxes and masks for the valid predictions.
-            # Shape of matched_gt_boxes: [num_matches, 4]
-            matched_gt_boxes = gt_box[valid_anchor_to_gt][:, 0, :]
-            # Shape of matched_gt_masks: [num_matches, proto_h, proto_w]
-            matched_gt_masks = down_target[valid_anchor_to_gt][:, 0, :, :]
+            valid_pred = seg_pred[valid_mask]
+            matched_gt_boxes = gt_box[valid_mask]
+            matched_gt_masks = down_target[valid_mask]
 
             # Mask the predicted masks using the ground truth boxes.
             masked_preds = mask_tensor_with_boxes(valid_pred, matched_gt_boxes)
@@ -317,7 +308,9 @@ class DualLoss:
                 target_seg is not None
                 and aux_seg_logits is not None
                 and main_seg_logits is not None
-            ), "When computing the loss with the segmentation masks, you must provide the seg targets and pred logits."
+            ), (
+                "When computing the loss with the segmentation masks, you must provide the seg targets and pred logits."
+            )
 
         # TODO: Need Refactor this region, make it flexible!
         aux_iou, aux_dfl, aux_cls, aux_seg = self.loss(
@@ -326,7 +319,7 @@ class DualLoss:
         main_iou, main_dfl, main_cls, main_seg = self.loss(
             main_predicts, targets, main_seg_logits, target_seg
         )
-        
+
         self.seg_rate = self.seg_rate or torch.tensor(0.0)
 
         total_loss = [

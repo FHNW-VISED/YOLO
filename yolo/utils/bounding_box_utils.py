@@ -296,7 +296,12 @@ class BoxMatcher:
         unique_indices = topk_mask.to(torch.uint8).argmax(dim=1)
         return unique_indices[..., None], topk_mask.any(dim=1), topk_mask
 
-    def __call__(self, target: Tensor, predict: Tuple[Tensor]) -> Tuple[Tensor, Tensor]:
+    def __call__(
+        self,
+        target: Tensor,
+        predict: Tuple[Tensor],
+        target_masks: Optional[Tensor] = None,
+    ) -> Tuple[Tensor, Tensor, Tensor, Optional[Tensor]]:
         """Matches each target to the most suitable anchor.
         1. For each anchor prediction, find the highest suitability targets.
         2. Match target to the best anchor.
@@ -326,7 +331,13 @@ class BoxMatcher:
             align_bbox = torch.zeros_like(predict_bbox, device=device)
             valid_mask = torch.zeros(predict_cls.shape[:2], dtype=bool, device=device)
             anchor_matched_targets = torch.cat([align_cls, align_bbox], dim=-1)
-            return anchor_matched_targets, valid_mask
+            if target_masks is not None:
+                aligned_masks = torch.zeros(
+                    target_masks.shape[0], predict_bbox.shape[1], *target_masks.shape[2:], device=device
+                )
+            else:
+                aligned_masks = None
+            return anchor_matched_targets, valid_mask, aligned_masks
 
         target_cls, target_bbox = target.split(
             [1, 4], dim=-1
@@ -375,7 +386,16 @@ class BoxMatcher:
         normalize_term = normalize_term.permute(0, 2, 1).gather(2, unique_indices)
         align_cls = align_cls * normalize_term * valid_mask[:, :, None]
         anchor_matched_targets = torch.cat([align_cls, align_bbox], dim=-1)
-        return anchor_matched_targets, valid_mask, unique_indices
+
+        # get the aligned masks
+        aligned_masks = None
+        if target_masks is not None:
+            aligned_masks = torch.gather(
+                target_masks,
+                1,
+                unique_indices[..., None].repeat(1, 1, *target_masks.shape[2:]),
+            )
+        return anchor_matched_targets, valid_mask, aligned_masks
 
 
 class Vec2Box:
