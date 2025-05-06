@@ -154,6 +154,7 @@ y_masks = y_masks.to(device)
 for epoch in range(EPOCHS):
     # Forward pass
     out = model(x)
+    
     det_logits, seg_logits = out["Main"]
     det_logits_aux, seg_logits_aux = out["AUX"]
 

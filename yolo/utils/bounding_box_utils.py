@@ -334,7 +334,10 @@ class BoxMatcher:
             anchor_matched_targets = torch.cat([align_cls, align_bbox], dim=-1)
             if target_masks is not None:
                 aligned_masks = torch.zeros(
-                    target_masks.shape[0], predict_bbox.shape[1], *target_masks.shape[2:], device=device
+                    target_masks.shape[0],
+                    predict_bbox.shape[1],
+                    *target_masks.shape[2:],
+                    device=device,
                 )
             else:
                 aligned_masks = None
@@ -390,7 +393,7 @@ class BoxMatcher:
 
         # to the aligned masks later
         aligned_masks_unique_idxs = unique_indices[..., None]
-            
+
         return anchor_matched_targets, valid_mask, aligned_masks_unique_idxs
 
 
@@ -607,15 +610,14 @@ def bbox_nms(
                         seg_nms.unsqueeze(0).float(),  # add batch dimension
                         size=image_size,
                         mode="bicubic",
-                        antialias=True
-                    ) 
-                    
+                        antialias=True,
+                    )
+
                     # Threshold to rebinarize
-                    seg_nms = (seg_nms > 0.4).float()
-                    
-                    # Morphological smoothing
-                    kernel = torch.ones(3, 3, device=seg_nms.device)  # Small smoothing kernel
-                    seg_nms = F.max_pool2d(seg_nms, kernel_size=3, padding=1, stride=1)[0]
+                    seg_nms = (seg_nms > 0.5).float()
+                    seg_nms = F.max_pool2d(seg_nms, kernel_size=3, padding=1, stride=1)[
+                        0
+                    ]
 
                 predicts_nms_seg.append(
                     mask_tensor_with_boxes(seg_nms, valid_boxes[selected_indices])
