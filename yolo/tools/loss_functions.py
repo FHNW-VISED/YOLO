@@ -10,7 +10,7 @@ from yolo.utils.bounding_box_utils import (
     BoxMatcher,
     Vec2Box,
     calculate_iou,
-    mask_tensor_with_boxes,
+    get_tensor_mask_from_boxes,
     reshape_batched_bboxes,
 )
 from yolo.utils.logger import logger
@@ -222,7 +222,7 @@ class MaskLoss(nn.Module):
         )
 
         # Generate predicted masks by applying sigmoid activation.
-        pred_masks = get_mask_preds(seg_logits_list, sigmoid=True)
+        pred_masks_logits = get_mask_preds(seg_logits_list, sigmoid=False)
 
         # Initialize a tensor to accumulate the normalized losses.
         total_losses = torch.zeros(
@@ -231,9 +231,9 @@ class MaskLoss(nn.Module):
         loss_count = 0
 
         # Process each item in the batch.
-        for down_gt, pred_mask, valid_flags, boxes, indices in zip(
+        for down_gt, pred_mask_logits, valid_flags, boxes, indices in zip(
             downsampled_gt_masks,
-            pred_masks,
+            pred_masks_logits,
             valid_mask_flags,
             rescaled_gt_boxes,
             unique_mask_indices,
@@ -249,16 +249,19 @@ class MaskLoss(nn.Module):
             )
 
             # Select only valid predictions and corresponding ground truth elements.
-            valid_pred_masks = pred_mask[valid_flags]
+            valid_pred_masks_logits = pred_mask_logits[valid_flags]
             valid_boxes = boxes[valid_flags]
 
             # Apply ground truth boxes to mask the predictions.
-            masked_pred = mask_tensor_with_boxes(valid_pred_masks, valid_boxes)
+            mask = get_tensor_mask_from_boxes(valid_pred_masks_logits, valid_boxes)
 
             # Compute per-pixel binary cross entropy loss without reduction.
-            pixel_loss = F.binary_cross_entropy(
-                masked_pred, valid_gt_masks, reduction="none"
+            pixel_loss = F.binary_cross_entropy_with_logits(
+                valid_pred_masks_logits, valid_gt_masks, reduction="none"
             )
+
+            pixel_loss = pixel_loss * mask
+
             # Sum loss per mask.
             loss_per_mask = pixel_loss.view(pixel_loss.size(0), -1).sum(dim=-1)
 

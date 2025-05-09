@@ -284,11 +284,13 @@ class BoxMatcher:
             valid_mask [batch x anchors]: Mask indicating the validity of each anchor
             topk_mask [batch x targets x anchors]: A boolean mask indicating the updated top-k scores' positions.
         """
-        duplicates = (topk_mask.sum(1, keepdim=True) > 1).repeat([
-            1,
-            topk_mask.size(1),
-            1,
-        ])
+        duplicates = (topk_mask.sum(1, keepdim=True) > 1).repeat(
+            [
+                1,
+                topk_mask.size(1),
+                1,
+            ]
+        )
         masked_iou_mat = topk_mask * iou_mat
         best_indices = masked_iou_mat.argmax(1)[:, None, :]
         best_target_mask = torch.zeros_like(duplicates, dtype=torch.bool)
@@ -619,9 +621,10 @@ def bbox_nms(
                         0
                     ]
 
-                predicts_nms_seg.append(
-                    mask_tensor_with_boxes(seg_nms, valid_boxes[selected_indices])
+                mask = get_tensor_mask_from_boxes(
+                    seg_nms, valid_boxes[selected_indices]
                 )
+                predicts_nms_seg.append(seg_nms * mask)
             else:
                 predicts_nms_seg.append(
                     torch.empty((0, *seg_mask.shape[-2:]), device=seg_mask.device)
@@ -644,7 +647,7 @@ def to_metrics_format(prediction: Tensor) -> Dict[str, Union[float, Tensor]]:
     return bbox
 
 
-def mask_tensor_with_boxes(tensor_to_mask, masking_boxes):
+def get_tensor_mask_from_boxes(tensor_to_mask, masking_boxes):
     """
     Mask a tensor with bounding boxes.
 
@@ -674,10 +677,9 @@ def mask_tensor_with_boxes(tensor_to_mask, masking_boxes):
 
     # Create a mask for each box.
     mask = (xs >= x1) & (xs < x2) & (ys >= y1) & (ys < y2)
-    mask = mask.to(tensor_to_mask.dtype)
 
     # Apply the mask to the tensor: pixels outside the boxes become 0.
-    return tensor_to_mask * mask
+    return mask
 
 
 def reshape_batched_bboxes(batched_bboxes, original_shape, new_shape):
