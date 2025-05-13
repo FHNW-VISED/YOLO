@@ -22,6 +22,7 @@ class YOLO(nn.Module):
 
     def __init__(self, model_cfg: ModelConfig, class_num: int = 80):
         super(YOLO, self).__init__()
+        self.model_cfg = model_cfg
         self.num_classes = class_num
         self.layer_map = get_layer_map()  # Get the map Dict[str: Module]
         self.model: List[YOLOLayer] = nn.ModuleList()
@@ -40,6 +41,9 @@ class YOLO(nn.Module):
             ):
                 layer_type, layer_info = next(iter(layer_spec.items()))
                 layer_args = layer_info.get("args", {})
+
+                if "num_maskes" in layer_args:
+                    layer_args["num_maskes"] = self.model_cfg.num_maskes
 
                 # Get input source
                 source = self.get_source_idx(layer_info.get("source", -1), layer_idx)
@@ -87,7 +91,7 @@ class YOLO(nn.Module):
         # eg. if in the yaml, "source" is set to -1, it means the input of the previous layer
         # if it's set to 0, it means the input of the first layer
         # if it's set to 1, it means the input of the second layer
-        # and so on 
+        # and so on
         # you can also refer to a tag of a layer, which is a string that you can set in the yaml
         # to refer to the output of a specific layer
         y = {0: x, **(external or {})}
@@ -194,7 +198,9 @@ class YOLO(nn.Module):
 
 
 def create_model(
-    model_cfg: ModelConfig, weight_path: Union[bool, Path] = True, class_num: int = 80
+    model_cfg: ModelConfig,
+    weight_path: Union[bool, Path] = True,
+    class_num: int = 80,
 ) -> YOLO:
     """Constructs and returns a model from a Dictionary configuration file.
 
