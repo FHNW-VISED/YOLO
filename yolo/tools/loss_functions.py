@@ -15,6 +15,7 @@ from yolo.utils.bounding_box_utils import (
 )
 from yolo.utils.logger import logger
 from yolo.utils.model_utils import get_mask_preds
+from einops import rearrange
 
 
 class BCELoss(nn.Module):
@@ -149,8 +150,9 @@ class YOLOLoss:
         loss_dfl = self.dfl(predicts_anc, targets_bbox, valid_masks, box_norm, cls_norm)
         ## -- SEG -- ##
         loss_seg = 0
+        loss_coeffs_diversity = 0
         if self.seg is not None and seg_logits_preds is not None:
-            loss_seg = self.seg(
+            loss_seg, loss_coeffs_diversity = self.seg(
                 seg_logits_preds,
                 targets_seg,
                 aligned_masks_unique_idxs,
@@ -160,7 +162,7 @@ class YOLOLoss:
                 box_norm,
             )
 
-        return loss_iou, loss_dfl, loss_cls, loss_seg
+        return loss_iou, loss_dfl, loss_cls, loss_seg, loss_coeffs_diversity
 
 
 class MaskLoss(nn.Module):
@@ -177,107 +179,164 @@ class MaskLoss(nn.Module):
     def __init__(self):
         super().__init__()
 
+    @staticmethod
+    def coeff_diversity_loss(coeffs, instance_t):
+        """
+        coeffs     should be size [num_pos, num_coeffs]
+        instance_t should be size [num_pos] and be values from 0 to num_instances-1
+        """
+        num_pos = coeffs.size(0)
+        instance_t = instance_t.view(-1)
+
+        coeffs_norm = F.normalize(coeffs, dim=1)
+        cos_sim = coeffs_norm @ coeffs_norm.t()
+
+        inst_eq = (
+            instance_t[:, None].expand_as(cos_sim)
+            == instance_t[None, :].expand_as(cos_sim)
+        ).float()
+
+        # Rescale to be between 0 and 1
+        cos_sim = (cos_sim + 1) / 2
+
+        # If they're the same instance, use cosine distance, else use cosine similarity
+        loss = (1 - cos_sim) * inst_eq + cos_sim * (1 - inst_eq)
+
+        # Only divide by num_pos once because we're summing over a num_pos x num_pos tensor
+        # and all the losses will be divided by num_pos at the end, so just one extra time.
+        return loss.sum() / (num_pos**2)
+
     def forward(
         self,
-        seg_logits_list,
-        gt_masks,
-        unique_mask_indices,
-        valid_mask_flags,
-        gt_boxes_aligned,
-        cls_normalizer,
-        box_normalizer,
+        prototype_logits: List[Tensor],
+        ground_truth_masks: Tensor,
+        mask_indices_list: List[Tensor],
+        valid_mask_map: Tensor,
+        aligned_gt_boxes: Tensor,
+        classification_norm: Tensor,
+        box_norm: Tensor,
     ):
         """
-        Computes the mask loss.
+        Compute the per‐mask BCE loss and the coefficient diversity loss.
 
-        Args:
-            seg_logits_list (List[Tensor]): List of predicted logits for each prototype.
-                Example shapes: [Tensor(3, 32, 64, 64), Tensor(3, 32, 32, 32), ...]
-            gt_masks (Tensor): Ground truth masks with shape (Batch, max_preds, H, W).
-                Example: Tensor(3, 10, 512, 512)
-            unique_mask_indices (List[Tensor]): Unique indices to gather aligned masks for each batch item.
-            valid_mask_flags (Tensor): Boolean tensor indicating valid masks; shape (Batch, total_anchors).
-            gt_boxes_aligned (Tensor): Ground truth boxes, shape (Batch, max_preds, 5).
-            cls_normalizer (Tensor): Normalizing factor for classification loss.
-            box_normalizer (Tensor): Normalizing factor for box loss, shaped as (Number of valid masks).
-
-        Returns:
-            final_loss (Tensor): The aggregated normalized mask loss.
+        Workflow:
+        1. Derive the target mask size from the last prototype.
+        2. If there are no GT masks present, return zero loss immediately.
+        3. Downsample and binarize all GT masks to prototype resolution.
+        4. Rescale GT boxes into the downsampled mask coordinate frame.
+        5. Decode predicted mask logits and flatten all mask coefficients.
+        6. Iterate over each batch element:
+            a. Skip if there are no valid masks.
+            b. Extract only the GT masks, predicted logits, boxes and coeffs for valid anchors.
+            c. Build a box‐based binary mask to zero out irrelevant pixels.
+            d. Compute per‐pixel BCE without reduction, apply the box mask.
+            e. Sum losses per mask and normalize by mask area.
+            f. Accumulate the normalized losses and the coeff‐diversity term.
+        7. Combine all per‐mask losses into the final loss, and average the diversity term.
         """
-        # Determine target prototype dimensions from the last predicted logits.
-        proto_h, proto_w = seg_logits_list[-1].shape[-2:]
+        # 1) Determine prototype height & width
+        proto_h, proto_w = prototype_logits[-1].shape[-2:]
 
-        # Downsample ground truth masks to match prototype shape and binarize.
-        downsampled_gt_masks = (
+        # 2) Early exit when no ground‐truth masks exist
+        if ground_truth_masks.shape[1] == 0:
+            return torch.tensor(0.0, device=ground_truth_masks.device)
+
+        # 3) Downsample & binarize GT masks to (proto_h, proto_w)
+        down_gt_masks = (
             F.interpolate(
-                gt_masks, size=(proto_h, proto_w), mode="bilinear", align_corners=False
+                ground_truth_masks,
+                size=(proto_h, proto_w),
+                mode="bilinear",
+                align_corners=False,
             )
             .gt(0.5)
             .float()
         )
 
-        # Rescale ground truth boxes to match the downsampled mask dimensions.
-        rescaled_gt_boxes = reshape_batched_bboxes(
-            gt_boxes_aligned, gt_masks.shape[-2:], downsampled_gt_masks.shape[-2:]
+        # 4) Warp GT boxes into the downsampled mask space
+        scaled_gt_boxes = reshape_batched_bboxes(
+            aligned_gt_boxes,
+            original_shape=ground_truth_masks.shape[-2:],  # (H, W)
+            new_shape=down_gt_masks.shape[-2:],  # (proto_h, proto_w)
         )
 
-        # Generate predicted masks by applying sigmoid activation.
-        pred_masks_logits = get_mask_preds(seg_logits_list, sigmoid=False)
+        # 5) Prepare predictions: raw logits and flattened coefficients
+        raw_pred_masks = get_mask_preds(prototype_logits, sigmoid=False)
+        coeff_list = []
+        for proto in prototype_logits[:-1]:
+            # (B, n_coeffs, w, h) → (B, w*h, n_coeffs)
+            coeff_list.append(rearrange(proto, "B C H W -> B (H W) C"))
+        all_coeffs = torch.cat(coeff_list, dim=1)
 
-        # Initialize a tensor to accumulate the normalized losses.
-        total_losses = torch.zeros(
-            valid_mask_flags.sum(), device=seg_logits_list[0].device
-        )
-        loss_count = 0
+        # Allocate storage for each valid mask’s normalized loss
+        total_valid = int(valid_mask_map.sum())
+        per_mask_losses = torch.zeros(total_valid, device=prototype_logits[0].device)
+        loss_cursor = 0
+        diversity_accum = torch.zeros(1, device=prototype_logits[0].device)
 
-        # Process each item in the batch.
-        for down_gt, pred_mask_logits, valid_flags, boxes, indices in zip(
-            downsampled_gt_masks,
-            pred_masks_logits,
-            valid_mask_flags,
-            rescaled_gt_boxes,
-            unique_mask_indices,
+        # 6) Loop over batch
+        for (
+            single_down_gt,
+            single_pred_logits,
+            valid_flags,
+            single_boxes,
+            mask_indices,
+            single_coeffs,
+        ) in zip(
+            down_gt_masks,
+            raw_pred_masks,
+            valid_mask_map,
+            scaled_gt_boxes,
+            mask_indices_list,
+            all_coeffs,
         ):
-            num_valid = valid_flags.sum()
+            num_valid = int(valid_flags.sum())
             if num_valid == 0:
                 continue
 
-            # Gather the aligned ground truth masks based on unique indices.
-            valid_indices = indices[valid_flags]
-            valid_gt_masks = torch.gather(
-                down_gt, 0, valid_indices.repeat(1, *down_gt.shape[1:])
+            # a) Pick out only the valid entries
+            valid_inds = mask_indices[valid_flags]  # [num_valid, ...]
+            valid_coeffs = single_coeffs[valid_flags]  # [num_valid, n_coeffs]
+            pred_logits = single_pred_logits[valid_flags]  # [num_valid, H, W]
+            gt_boxes = single_boxes[valid_flags]  # [num_valid, 4]
+
+            # b) Gather the matching downsampled GT masks
+            #    mask_indices are indices into the first dim of single_down_gt
+            gt_masks_sel = torch.gather(
+                single_down_gt,
+                0,
+                valid_inds.repeat(1, single_down_gt.shape[1], single_down_gt.shape[2]),
             )
 
-            # Select only valid predictions and corresponding ground truth elements.
-            valid_pred_masks_logits = pred_mask_logits[valid_flags]
-            valid_boxes = boxes[valid_flags]
+            # c) Create a binary mask from boxes to zero out outside‐box pixels
+            box_mask = get_tensor_mask_from_boxes(pred_logits, gt_boxes)
 
-            # Apply ground truth boxes to mask the predictions.
-            mask = get_tensor_mask_from_boxes(valid_pred_masks_logits, valid_boxes)
-
-            # Compute per-pixel binary cross entropy loss without reduction.
-            pixel_loss = F.binary_cross_entropy_with_logits(
-                valid_pred_masks_logits, valid_gt_masks, reduction="none"
+            # d) BCE per pixel, then apply the box mask
+            pixel_bce = (
+                F.binary_cross_entropy_with_logits(
+                    pred_logits, gt_masks_sel, reduction="none"
+                )
+                * box_mask
             )
 
-            pixel_loss = pixel_loss * mask
+            # e) Sum & normalize by mask area
+            sum_loss = pixel_bce.view(num_valid, -1).sum(dim=1)
+            mask_areas = gt_masks_sel.view(num_valid, -1).sum(dim=1).float()
 
-            # Sum loss per mask.
-            loss_per_mask = pixel_loss.view(pixel_loss.size(0), -1).sum(dim=-1)
+            normalized_loss = sum_loss / (mask_areas + 1.0)
 
-            # Compute the area (sum of pixels) of each ground truth mask.
-            area_per_mask = valid_gt_masks.view(valid_gt_masks.size(0), -1).sum(dim=-1)
-            # Normalize loss per mask by its area.
-            norm_loss_per_mask = loss_per_mask / (area_per_mask.float() + 1e-6)
+            # f) Record into the global tensor
+            per_mask_losses[loss_cursor : loss_cursor + num_valid] = normalized_loss
+            loss_cursor += num_valid
 
-            total_losses[loss_count : loss_count + num_valid] = norm_loss_per_mask
-            loss_count += num_valid
+            # g) Accumulate coefficient diversity loss
+            diversity_accum += self.coeff_diversity_loss(valid_coeffs, valid_inds[:, 0])
 
-        # Aggregate the normalized loss with provided normalizers.
-        final_loss = (total_losses * box_normalizer).sum() / (
-            cls_normalizer * valid_mask_flags.sum()
-        )
-        return final_loss
+        # 7) Final aggregation
+        final_mask_loss = (per_mask_losses * box_norm).sum() / (classification_norm)
+        final_diversity_loss = diversity_accum / all_coeffs.size(0)
+
+        return final_mask_loss, final_diversity_loss
 
 
 class DualLoss:
@@ -290,6 +349,7 @@ class DualLoss:
         self.dfl_rate = loss_cfg.objective["DFLoss"]
         self.cls_rate = loss_cfg.objective["BCELoss"]
         self.seg_rate = loss_cfg.objective.get("LincombMaskLoss", None)
+        self.coeffs_diversity_rate = loss_cfg.objective.get("CoeffsDiversityLoss", 0)
 
         self.loss = YOLOLoss(
             loss_cfg,
@@ -319,10 +379,10 @@ class DualLoss:
             )
 
         # TODO: Need Refactor this region, make it flexible!
-        aux_iou, aux_dfl, aux_cls, aux_seg = self.loss(
+        aux_iou, aux_dfl, aux_cls, aux_seg, aux_coeffs_diversity = self.loss(
             aux_predicts, targets, aux_seg_logits, target_seg
         )
-        main_iou, main_dfl, main_cls, main_seg = self.loss(
+        main_iou, main_dfl, main_cls, main_seg, main_coeffs_diversity = self.loss(
             main_predicts, targets, main_seg_logits, target_seg
         )
 
@@ -333,10 +393,14 @@ class DualLoss:
             self.dfl_rate * (aux_dfl * self.aux_rate + main_dfl),
             self.cls_rate * (aux_cls * self.aux_rate + main_cls),
             self.seg_rate * (aux_seg * self.aux_rate + main_seg),
+            self.coeffs_diversity_rate
+            * (aux_coeffs_diversity * self.aux_rate + main_coeffs_diversity),
         ]
         loss_dict = {
             f"Loss/{name}Loss": value.detach().item()
-            for name, value in zip(["Box", "DFL", "BCE", "LincombMask"], total_loss)
+            for name, value in zip(
+                ["Box", "DFL", "BCE", "LincombMask", "CoeffsDiversityLoss"], total_loss
+            )
         }
         return sum(total_loss), loss_dict
 
