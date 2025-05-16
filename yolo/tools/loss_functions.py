@@ -239,7 +239,9 @@ class MaskLoss(nn.Module):
 
         # 2) Early exit when no ground‐truth masks exist
         if ground_truth_masks.shape[1] == 0:
-            return torch.tensor(0.0, device=ground_truth_masks.device)
+            return torch.tensor(0.0, device=ground_truth_masks.device), torch.tensor(
+                0.0, device=ground_truth_masks.device
+            )
 
         # 3) Downsample & binarize GT masks to (proto_h, proto_w)
         down_gt_masks = (
