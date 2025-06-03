@@ -11,6 +11,7 @@ from lightning import LightningModule, Trainer
 from lightning.pytorch.callbacks import Callback
 from omegaconf import ListConfig
 from torch import Tensor, no_grad
+import torch.nn.functional as F
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LambdaLR, SequentialLR, _LRScheduler
 
@@ -211,7 +212,7 @@ class PostProcess:
         pred_conf = prediction[3] if len(prediction) == 4 else None
         if rev_tensor is not None:
             pred_bbox = (pred_bbox - rev_tensor[:, None, 1:]) / rev_tensor[:, 0:1, None]
-            
+
         pred_bbox, pred_mask = bbox_nms(
             pred_class,
             pred_bbox,
@@ -222,6 +223,12 @@ class PostProcess:
         )
 
         if pred_mask is not None:
+            pred_mask = [
+                F.interpolate(x[None], self.converter.image_size, mode="bilinear")
+                if len(x) > 0
+                else torch.empty((0, *self.converter.image_size))
+                for x in pred_mask
+            ]
             pred_mask = [(x > seg_threshold).float() for x in pred_mask]
             return pred_bbox, pred_mask
 
