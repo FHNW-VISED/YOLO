@@ -202,10 +202,10 @@ class PostProcess:
 
         predict = predict["Main"]
 
-        seg_preds = None
+        seg_preds_logits = None
         if isinstance(predict, tuple):
             predict, seg_logits = predict
-            seg_preds = get_mask_preds(seg_logits, sigmoid=True).float()
+            seg_preds_logits = get_mask_preds(seg_logits, sigmoid=False)
 
         prediction = self.converter(predict)
         pred_class, _, pred_bbox = prediction[:3]
@@ -218,18 +218,20 @@ class PostProcess:
             pred_bbox,
             self.nms,
             pred_conf,
-            seg_preds,
+            seg_preds_logits,
             self.converter.image_size,
         )
 
         if pred_mask is not None:
+            # better to resize the logits, then apply sigmoid
             pred_mask = [
-                F.interpolate(x[None], self.converter.image_size, mode="bilinear")
+                torch.sigmoid(F.interpolate(x[:, None], self.converter.image_size, mode="bilinear"))
                 if len(x) > 0
-                else torch.empty((0, *self.converter.image_size))
+                else torch.empty((0, 1, *self.converter.image_size))
                 for x in pred_mask
             ]
-            pred_mask = [(x > seg_threshold).float() for x in pred_mask]
+
+            pred_mask = [(x[:, 0] >= seg_threshold).float() for x in pred_mask]
             return pred_bbox, pred_mask
 
         return pred_bbox

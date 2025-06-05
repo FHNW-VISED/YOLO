@@ -612,19 +612,12 @@ def bbox_nms(
                         seg_nms.unsqueeze(0).float(),  # add batch dimension
                         size=image_size,
                         mode="bicubic",
-                        antialias=True,
-                    )
+                    )[0]
 
-                    # Threshold to rebinarize
-                    seg_nms = (seg_nms > 0.5).float()
-                    seg_nms = F.max_pool2d(seg_nms, kernel_size=3, padding=1, stride=1)[
-                        0
-                    ]
-
-                mask = get_tensor_mask_from_boxes(
-                    seg_nms, valid_boxes[selected_indices]
-                )
-                predicts_nms_seg.append(seg_nms * mask)
+                mask_bool = get_tensor_mask_from_boxes(seg_nms, valid_boxes[selected_indices])
+                fill_value = torch.finfo(seg_nms.dtype).min
+                masked_seg = torch.where(mask_bool, seg_nms, torch.full_like(seg_nms, fill_value))
+                predicts_nms_seg.append(masked_seg)
             else:
                 predicts_nms_seg.append(
                     torch.empty((0, *seg_mask.shape[-2:]), device=seg_mask.device)
