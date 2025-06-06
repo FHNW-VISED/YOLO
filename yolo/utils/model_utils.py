@@ -195,7 +195,6 @@ class PostProcess:
         predict,
         rev_tensor: Optional[Tensor] = None,
         image_size: Optional[List[int]] = None,
-        seg_threshold: float = 0.5,
     ) -> Union[Tensor, List[Tensor]]:
         if image_size is not None:
             self.converter.update(image_size)
@@ -213,7 +212,7 @@ class PostProcess:
         if rev_tensor is not None:
             pred_bbox = (pred_bbox - rev_tensor[:, None, 1:]) / rev_tensor[:, 0:1, None]
 
-        pred_bbox, pred_mask = bbox_nms(
+        pred_bbox, pred_mask_logits = bbox_nms(
             pred_class,
             pred_bbox,
             self.nms,
@@ -222,17 +221,17 @@ class PostProcess:
             self.converter.image_size,
         )
 
-        if pred_mask is not None:
+        if pred_mask_logits is not None:
             # better to resize the logits, then apply sigmoid
-            pred_mask = [
+            pred_mask_probs = [
                 torch.sigmoid(F.interpolate(x[:, None], self.converter.image_size, mode="bilinear"))
                 if len(x) > 0
                 else torch.empty((0, 1, *self.converter.image_size))
-                for x in pred_mask
+                for x in pred_mask_logits
             ]
 
-            pred_mask = [(x[:, 0] >= seg_threshold).float() for x in pred_mask]
-            return pred_bbox, pred_mask
+            pred_mask_probs = [x[:, 0].float() for x in pred_mask_probs]
+            return pred_bbox, pred_mask_probs
 
         return pred_bbox
 
