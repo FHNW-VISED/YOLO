@@ -149,8 +149,8 @@ class YOLOLoss:
         ## -- DFL -- ##
         loss_dfl = self.dfl(predicts_anc, targets_bbox, valid_masks, box_norm, cls_norm)
         ## -- SEG -- ##
-        loss_seg = 0
-        loss_coeffs_diversity = 0
+        loss_seg = torch.tensor(0.0, device=predicts_cls.device)
+        loss_coeffs_diversity = torch.tensor(0.0, device=predicts_cls.device)
         if self.seg is not None and seg_logits_preds is not None:
             loss_seg, loss_coeffs_diversity = self.seg(
                 seg_logits_preds,
@@ -349,7 +349,7 @@ class DualLoss:
         self.iou_rate = loss_cfg.objective["BoxLoss"]
         self.dfl_rate = loss_cfg.objective["DFLoss"]
         self.cls_rate = loss_cfg.objective["BCELoss"]
-        self.seg_rate = loss_cfg.objective.get("LincombMaskLoss", None)
+        self.seg_rate = loss_cfg.objective.get("LincombMaskLoss", 0)
         self.coeffs_diversity_rate = loss_cfg.objective.get("CoeffsDiversityLoss", 0)
 
         self.loss = YOLOLoss(
@@ -370,14 +370,10 @@ class DualLoss:
         aux_seg_logits: Optional[List[Tensor]] = None,
         main_seg_logits: Optional[List[Tensor]] = None,
     ) -> Tuple[Tensor, Dict[str, float]]:
-        if self.seg_rate is not None:
-            assert (
-                target_seg is not None
-                and aux_seg_logits is not None
-                and main_seg_logits is not None
-            ), (
-                "When computing the loss with the segmentation masks, you must provide the seg targets and pred logits."
-            )
+        if self.seg_rate != 0:
+            if target_seg is None or aux_seg_logits is None or main_seg_logits is None:
+                msg = "When computing the loss with the segmentation masks, you must provide the seg targets and pred logits."
+                raise ValueError(msg)
 
         # TODO: Need Refactor this region, make it flexible!
         aux_iou, aux_dfl, aux_cls, aux_seg, aux_coeffs_diversity = self.loss(
@@ -386,8 +382,6 @@ class DualLoss:
         main_iou, main_dfl, main_cls, main_seg, main_coeffs_diversity = self.loss(
             main_predicts, targets, main_seg_logits, target_seg
         )
-
-        self.seg_rate = self.seg_rate or torch.tensor(0.0)
 
         total_loss = [
             self.iou_rate * (aux_iou * self.aux_rate + main_iou),
