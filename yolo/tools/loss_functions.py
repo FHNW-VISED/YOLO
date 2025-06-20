@@ -157,7 +157,7 @@ class YOLOLoss:
                 targets_seg,
                 aligned_masks_unique_idxs,
                 valid_masks,
-                align_targets.clone()[..., 2:],
+                targets_bbox,
                 cls_norm,
                 box_norm,
             )
