@@ -6,10 +6,12 @@ from typing import List, Optional, Type, Union
 
 import torch
 import torch.distributed as dist
+from einops import rearrange
 from lightning import LightningModule, Trainer
 from lightning.pytorch.callbacks import Callback
 from omegaconf import ListConfig
 from torch import Tensor, no_grad
+import torch.nn.functional as F
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LambdaLR, SequentialLR, _LRScheduler
 
@@ -58,11 +60,15 @@ class EMA(Callback):
         pl_module.ema.load_state_dict(self.ema_state_dict)
 
     @no_grad()
-    def on_train_batch_end(self, trainer: "Trainer", pl_module: "LightningModule", *args, **kwargs) -> None:
+    def on_train_batch_end(
+        self, trainer: "Trainer", pl_module: "LightningModule", *args, **kwargs
+    ) -> None:
         self.step += 1
         decay_factor = self.decay * (1 - exp(-self.step / self.tau))
         for key, param in pl_module.model.state_dict().items():
-            self.ema_state_dict[key] = lerp(param.detach(), self.ema_state_dict[key], decay_factor)
+            self.ema_state_dict[key] = lerp(
+                param.detach(), self.ema_state_dict[key], decay_factor
+            )
 
 
 def create_optimizer(model: YOLO, optim_cfg: OptimizerConfig) -> Optimizer:
@@ -74,8 +80,14 @@ def create_optimizer(model: YOLO, optim_cfg: OptimizerConfig) -> Optimizer:
     optimizer_class: Type[Optimizer] = getattr(torch.optim, optim_cfg.type)
 
     bias_params = [p for name, p in model.named_parameters() if "bias" in name]
-    norm_params = [p for name, p in model.named_parameters() if "weight" in name and "bn" in name]
-    conv_params = [p for name, p in model.named_parameters() if "weight" in name and "bn" not in name]
+    norm_params = [
+        p for name, p in model.named_parameters() if "weight" in name and "bn" in name
+    ]
+    conv_params = [
+        p
+        for name, p in model.named_parameters()
+        if "weight" in name and "bn" not in name
+    ]
 
     model_parameters = [
         {"params": bias_params, "momentum": 0.937, "weight_decay": 0},
@@ -101,7 +113,9 @@ def create_optimizer(model: YOLO, optim_cfg: OptimizerConfig) -> Optimizer:
         for lr_idx, param_group in enumerate(self.param_groups):
             min_lr, max_lr = self.min_lr[lr_idx], self.max_lr[lr_idx]
             param_group["lr"] = lerp(min_lr, max_lr, self.batch_idx, self.batch_num)
-            param_group["momentum"] = lerp(self.min_mom, self.max_mom, self.batch_idx, self.batch_num)
+            param_group["momentum"] = lerp(
+                self.min_mom, self.max_mom, self.batch_idx, self.batch_num
+            )
             lr_dict[f"LR/{lr_idx}"] = param_group["lr"]
             lr_dict[f"momentum/{lr_idx}"] = param_group["momentum"]
         return lr_dict
@@ -114,20 +128,26 @@ def create_optimizer(model: YOLO, optim_cfg: OptimizerConfig) -> Optimizer:
     return optimizer
 
 
-def create_scheduler(optimizer: Optimizer, schedule_cfg: SchedulerConfig) -> _LRScheduler:
+def create_scheduler(
+    optimizer: Optimizer, schedule_cfg: SchedulerConfig
+) -> _LRScheduler:
     """Create a learning rate scheduler for the given optimizer based on the configuration.
 
     Returns:
         An instance of the scheduler configured according to the provided settings.
     """
-    scheduler_class: Type[_LRScheduler] = getattr(torch.optim.lr_scheduler, schedule_cfg.type)
+    scheduler_class: Type[_LRScheduler] = getattr(
+        torch.optim.lr_scheduler, schedule_cfg.type
+    )
     schedule = scheduler_class(optimizer, **schedule_cfg.args)
     if hasattr(schedule_cfg, "warmup"):
         wepoch = schedule_cfg.warmup.epochs
         lambda1 = lambda epoch: (epoch + 1) / wepoch if epoch < wepoch else 1
         lambda2 = lambda epoch: 10 - 9 * ((epoch + 1) / wepoch) if epoch < wepoch else 1
         warmup_schedule = LambdaLR(optimizer, lr_lambda=[lambda2, lambda1, lambda1])
-        schedule = SequentialLR(optimizer, schedulers=[warmup_schedule, schedule], milestones=[wepoch - 1])
+        schedule = SequentialLR(
+            optimizer, schedulers=[warmup_schedule, schedule], milestones=[wepoch - 1]
+        )
     return schedule
 
 
@@ -151,7 +171,9 @@ def get_device(device_spec: Union[str, int, List[int]]) -> torch.device:
         return torch.device(device_spec), ddp_flag
     if not torch.cuda.is_available():
         if device_spec != "cpu":
-            logger.warning(f"❎ Device spec: {device_spec} not support, Choosing CPU instead")
+            logger.warning(
+                f"❎ Device spec: {device_spec} not support, Choosing CPU instead"
+            )
         return torch.device("cpu"), False
 
     device = torch.device(device_spec)
@@ -169,16 +191,48 @@ class PostProcess:
         self.nms = nms_cfg
 
     def __call__(
-        self, predict, rev_tensor: Optional[Tensor] = None, image_size: Optional[List[int]] = None
-    ) -> List[Tensor]:
+        self,
+        predict,
+        rev_tensor: Optional[Tensor] = None,
+        image_size: Optional[List[int]] = None,
+    ) -> Union[Tensor, List[Tensor]]:
         if image_size is not None:
             self.converter.update(image_size)
-        prediction = self.converter(predict["Main"])
+
+        predict = predict["Main"]
+
+        seg_preds_logits = None
+        if isinstance(predict, tuple):
+            predict, seg_logits = predict
+            seg_preds_logits = get_mask_preds(seg_logits, sigmoid=False)
+
+        prediction = self.converter(predict)
         pred_class, _, pred_bbox = prediction[:3]
         pred_conf = prediction[3] if len(prediction) == 4 else None
         if rev_tensor is not None:
             pred_bbox = (pred_bbox - rev_tensor[:, None, 1:]) / rev_tensor[:, 0:1, None]
-        pred_bbox = bbox_nms(pred_class, pred_bbox, self.nms, pred_conf)
+
+        pred_bbox, pred_mask_logits = bbox_nms(
+            pred_class,
+            pred_bbox,
+            self.nms,
+            pred_conf,
+            seg_preds_logits,
+            self.converter.image_size,
+        )
+
+        if pred_mask_logits is not None:
+            # better to resize the logits, then apply sigmoid
+            pred_mask_probs = [
+                torch.sigmoid(F.interpolate(x[:, None], self.converter.image_size, mode="bilinear"))
+                if len(x) > 0
+                else torch.empty((0, 1, *self.converter.image_size))
+                for x in pred_mask_logits
+            ]
+
+            pred_mask_probs = [x[:, 0].float() for x in pred_mask_probs]
+            return pred_bbox, pred_mask_probs
+
         return pred_bbox
 
 
@@ -222,3 +276,21 @@ def predicts_to_json(img_paths, predicts, rev_tensor):
             }
             batch_json.append(bbox)
     return batch_json
+
+
+def get_mask_preds(seg_logits, sigmoid=False):
+    # linear combination of the coefficients with the mask predictions
+    coeffs, proto = seg_logits[:-1], seg_logits[-1]
+
+    reshaped_coeffs = []
+    for coeff in coeffs:
+        reshaped_coeff = rearrange(coeff, "B M w h -> B (w h) M")
+        reshaped_coeffs.append(reshaped_coeff)
+
+    pred_coeffs = torch.concat(reshaped_coeffs, dim=1)
+
+    pred_masks_logits = torch.einsum("bnm, bmhw -> bnhw", pred_coeffs, proto)
+    if not sigmoid:
+        return pred_masks_logits
+
+    return torch.sigmoid(pred_masks_logits)
