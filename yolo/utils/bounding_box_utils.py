@@ -284,13 +284,11 @@ class BoxMatcher:
             valid_mask [batch x anchors]: Mask indicating the validity of each anchor
             topk_mask [batch x targets x anchors]: A boolean mask indicating the updated top-k scores' positions.
         """
-        duplicates = (topk_mask.sum(1, keepdim=True) > 1).repeat(
-            [
-                1,
-                topk_mask.size(1),
-                1,
-            ]
-        )
+        duplicates = (topk_mask.sum(1, keepdim=True) > 1).repeat([
+            1,
+            topk_mask.size(1),
+            1,
+        ])
         masked_iou_mat = topk_mask * iou_mat
         best_indices = masked_iou_mat.argmax(1)[:, None, :]
         best_target_mask = torch.zeros_like(duplicates, dtype=torch.bool)
@@ -614,9 +612,13 @@ def bbox_nms(
                         mode="bicubic",
                     )[0]
 
-                mask_bool = get_tensor_mask_from_boxes(seg_nms, valid_boxes[selected_indices])
+                mask_bool = get_tensor_mask_from_boxes(
+                    seg_nms, valid_boxes[selected_indices]
+                )
                 fill_value = torch.finfo(seg_nms.dtype).min
-                masked_seg = torch.where(mask_bool, seg_nms, torch.full_like(seg_nms, fill_value))
+                masked_seg = torch.where(
+                    mask_bool, seg_nms, torch.full_like(seg_nms, fill_value)
+                )
                 predicts_nms_seg.append(masked_seg)
             else:
                 predicts_nms_seg.append(

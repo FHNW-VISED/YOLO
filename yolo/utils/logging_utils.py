@@ -19,7 +19,6 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
-import wandb
 from lightning import LightningModule, Trainer, seed_everything
 from lightning.pytorch.callbacks import Callback, RichModelSummary, RichProgressBar
 from lightning.pytorch.callbacks.progress.rich_progress import CustomProgress
@@ -35,6 +34,7 @@ from torch import Tensor
 from torch.nn import ModuleList
 from typing_extensions import override
 
+import wandb
 from yolo.config.config import Config, YOLOLayer
 from yolo.model.yolo import YOLO
 from yolo.utils.logger import logger

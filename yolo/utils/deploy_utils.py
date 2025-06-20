@@ -15,16 +15,20 @@ class FastModelLoader:
         self.class_num = cfg.dataset.class_num
 
         self._validate_compiler()
-        if cfg.weight == True:
+        if cfg.weight:
             cfg.weight = Path("weights") / f"{cfg.model.name}.pt"
         self.model_path = f"{Path(cfg.weight).stem}.{self.compiler}"
 
     def _validate_compiler(self):
         if self.compiler not in ["onnx", "trt", "deploy"]:
-            logger.warning(f":warning: Compiler '{self.compiler}' is not supported. Using original model.")
+            logger.warning(
+                f":warning: Compiler '{self.compiler}' is not supported. Using original model."
+            )
             self.compiler = None
         if self.cfg.device == "mps" and self.compiler == "trt":
-            logger.warning(":red_apple: TensorRT does not support MPS devices. Using original model.")
+            logger.warning(
+                ":red_apple: TensorRT does not support MPS devices. Using original model."
+            )
             self.compiler = None
 
     def load_model(self, device):
@@ -34,7 +38,9 @@ class FastModelLoader:
             return self._load_trt_model().to(device)
         elif self.compiler == "deploy":
             self.cfg.model.model.auxiliary = {}
-        return create_model(self.cfg.model, class_num=self.class_num, weight_path=self.cfg.weight).to(device)
+        return create_model(
+            self.cfg.model, class_num=self.class_num, weight_path=self.cfg.weight
+        ).to(device)
 
     def _load_onnx_model(self, device):
         from onnxruntime import InferenceSession
@@ -69,7 +75,9 @@ class FastModelLoader:
         from onnxruntime import InferenceSession
         from torch.onnx import export
 
-        model = create_model(self.cfg.model, class_num=self.class_num, weight_path=self.cfg.weight).eval()
+        model = create_model(
+            self.cfg.model, class_num=self.class_num, weight_path=self.cfg.weight
+        ).eval()
         dummy_input = torch.ones((1, 3, *self.cfg.image_size))
         export(
             model,
@@ -97,7 +105,9 @@ class FastModelLoader:
     def _create_trt_model(self):
         from torch2trt import torch2trt
 
-        model = create_model(self.cfg.model, class_num=self.class_num, weight_path=self.cfg.weight).eval()
+        model = create_model(
+            self.cfg.model, class_num=self.class_num, weight_path=self.cfg.weight
+        ).eval()
         dummy_input = torch.ones((1, 3, *self.cfg.image_size)).cuda()
         logger.info(f"♻️ Creating TensorRT model")
         model_trt = torch2trt(model.cuda(), [dummy_input])
