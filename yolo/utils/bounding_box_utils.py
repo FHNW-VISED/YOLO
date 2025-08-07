@@ -602,7 +602,7 @@ def bbox_nms(
         # Process segmentation masks if they were provided.
         if seg_mask is not None and valid_seg_masks is not None:
             if selected_indices.numel() > 0:
-                seg_nms = valid_seg_masks[selected_indices]
+                seg_nms = valid_seg_masks[selected_indices][: nms_cfg.max_bbox]
 
                 # Resize segmentation masks to the original image size if specified.
                 if image_size is not None:
@@ -613,7 +613,7 @@ def bbox_nms(
                     )[0]
 
                 mask_bool = get_tensor_mask_from_boxes(
-                    seg_nms, valid_boxes[selected_indices]
+                    seg_nms, valid_boxes[selected_indices][: nms_cfg.max_bbox]
                 )
                 fill_value = torch.finfo(seg_nms.dtype).min
                 masked_seg = torch.where(
